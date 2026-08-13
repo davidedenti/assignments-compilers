@@ -1,0 +1,6 @@
+.idea/
+.vscode/
+**/BUILD/
+*.ll
+*.fun.dot
+CMakeLists.txt
