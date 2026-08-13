@@ -12,4 +12,4 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 
-add_llvm_pass_plugin(LocalOpts ../Src/LocalOpts.cpp)
+add_llvm_pass_plugin(LocalOpts LocalOpts.cpp)
