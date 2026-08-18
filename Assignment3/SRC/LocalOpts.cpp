@@ -16,6 +16,7 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
+#include <vector>
 
 using namespace llvm;
 
@@ -47,7 +48,6 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
-    bool Changed = false;
 
     // TODO Assignment 3
     // Per ciascun loop, usare LI e DT per:
@@ -80,9 +80,32 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
           }
         }
       } while (NuovaInvariante);
-    }
 
-    (void)DT;
+      BasicBlock *Preheader = L->getLoopPreheader();
+
+      if (!Preheader) { continue; }
+      std::vector<BasicBlock *> BlocchiUscita;
+      L->getExitBlocks(BlocchiUscita);
+
+      for (Instruction *I : IstruzioniInvarianti) {
+        BasicBlock *BloccoIstruzione = I->getParent();
+        bool DominaTutteLeUscite = true;
+
+        for (BasicBlock *BloccoUscita : BlocchiUscita) {
+          if (!DT.dominates(BloccoIstruzione, BloccoUscita)) {
+            DominaTutteLeUscite = false;
+            break;
+          }
+        }
+
+        if (DominaTutteLeUscite) {
+          outs() << "L'istruzione domina tutte le uscite: ";
+          I->print(outs());
+          outs() << "\n";
+        }
+
+      }
+    }
 
     // Cambiare in PreservedAnalyses::none() appena il pass modificherà l'IR.
     return PreservedAnalyses::all();
