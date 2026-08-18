@@ -14,15 +14,40 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/raw_ostream.h"
+#include <set>
 
 using namespace llvm;
 
 namespace {
 
+
+  bool isReachingDefinitionFunction(Instruction &I, Loop &L, std::set<Instruction *> &IstruzioniInvarianti) {
+    BinaryOperator *Op = dyn_cast<BinaryOperator>(&I);
+
+    if (!Op) { return false; }
+
+    Value *Op1 = Op->getOperand(0);
+    Value *Op2 = Op->getOperand(1);
+
+    Instruction *Definizione1 = dyn_cast<Instruction>(Op1);
+    Instruction *Definizione2 = dyn_cast<Instruction>(Op2);
+
+    bool Definizione1DentroLoop = Definizione1 && L.contains(Definizione1->getParent());
+    bool Definizione2DentroLoop = Definizione2 && L.contains(Definizione2->getParent());
+
+    if (Definizione1DentroLoop && IstruzioniInvarianti.find(Definizione1) == IstruzioniInvarianti.end()) { return false; }
+
+    if (Definizione2DentroLoop && IstruzioniInvarianti.find(Definizione2) == IstruzioniInvarianti.end()) { return false; }
+
+    return true;
+  }
+
 struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+    bool Changed = false;
 
     // TODO Assignment 3
     // Per ciascun loop, usare LI e DT per:
@@ -33,7 +58,30 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
     // Punti di partenza utili:
     //   Loop::getLoopPreheader(), Loop::contains(), Loop::getExitBlocks()
     //   DominatorTree::dominates(), Instruction::moveBefore().
-    (void)LI;
+    for (Loop *L : LI) {
+      std::set<Instruction *> IstruzioniInvarianti;
+      bool NuovaInvariante = false;
+
+      do {
+        NuovaInvariante = false;
+
+        for (BasicBlock *BB : L->blocks()) {
+          for (Instruction &I : *BB) {
+            if (isReachingDefinitionFunction(I, *L, IstruzioniInvarianti)) {
+              auto Inserimento = IstruzioniInvarianti.insert(&I);
+
+              if (Inserimento.second) {
+                NuovaInvariante = true;
+                outs() << "Istruzione potenzialmente loop-invariant: ";
+                I.print(outs());
+                outs() << "\n";
+              }
+            }
+          }
+        }
+      } while (NuovaInvariante);
+    }
+
     (void)DT;
 
     // Cambiare in PreservedAnalyses::none() appena il pass modificherà l'IR.
