@@ -1,10 +1,6 @@
 //===----------------------------------------------------------------------===//
 // Terzo assignment di "Compilatori - Middle end"
 // Loop-Invariant Code Motion
-//
-// Il nome del passo NON usa l'acronimo "LICM", perché LLVM ne possiede già
-// uno ufficiale. Il passo è invocabile con:
-//   opt -load-pass-plugin=./LocalOpts.so -passes=loop-invariant-motion ...
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Analysis/LoopInfo.h"
@@ -22,44 +18,35 @@ using namespace llvm;
 
 namespace {
 
+bool isReachingDefinitionFunction(Instruction &I, Loop &L, std::set<Instruction *> &IstruzioniInvarianti) {
+  BinaryOperator *Op = dyn_cast<BinaryOperator>(&I);
 
-  bool isReachingDefinitionFunction(Instruction &I, Loop &L, std::set<Instruction *> &IstruzioniInvarianti) {
-    BinaryOperator *Op = dyn_cast<BinaryOperator>(&I);
+  if (!Op) { return false; }
 
-    if (!Op) { return false; }
+  Value *Op1 = Op->getOperand(0);
+  Value *Op2 = Op->getOperand(1);
 
-    Value *Op1 = Op->getOperand(0);
-    Value *Op2 = Op->getOperand(1);
+  Instruction *Definizione1 = dyn_cast<Instruction>(Op1);
+  Instruction *Definizione2 = dyn_cast<Instruction>(Op2);
 
-    Instruction *Definizione1 = dyn_cast<Instruction>(Op1);
-    Instruction *Definizione2 = dyn_cast<Instruction>(Op2);
+  bool Definizione1DentroLoop = Definizione1 && L.contains(Definizione1->getParent());
+  bool Definizione2DentroLoop = Definizione2 && L.contains(Definizione2->getParent());
 
-    bool Definizione1DentroLoop = Definizione1 && L.contains(Definizione1->getParent());
-    bool Definizione2DentroLoop = Definizione2 && L.contains(Definizione2->getParent());
+  if (Definizione1DentroLoop && IstruzioniInvarianti.find(Definizione1) == IstruzioniInvarianti.end()) { return false; }
+  if (Definizione2DentroLoop && IstruzioniInvarianti.find(Definizione2) == IstruzioniInvarianti.end()) { return false; }
 
-    if (Definizione1DentroLoop && IstruzioniInvarianti.find(Definizione1) == IstruzioniInvarianti.end()) { return false; }
-
-    if (Definizione2DentroLoop && IstruzioniInvarianti.find(Definizione2) == IstruzioniInvarianti.end()) { return false; }
-
-    return true;
-  }
+  return true;
+}
 
 struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+    bool IRModificato = false;
 
-    // TODO Assignment 3
-    // Per ciascun loop, usare LI e DT per:
-    //  1. individuare le istruzioni loop-invariant;
-    //  2. verificare le condizioni di correttezza per lo spostamento;
-    //  3. spostare le istruzioni candidate nel preheader del loop.
-    //
-    // Punti di partenza utili:
-    //   Loop::getLoopPreheader(), Loop::contains(), Loop::getExitBlocks()
-    //   DominatorTree::dominates(), Instruction::moveBefore().
     for (Loop *L : LI) {
       std::set<Instruction *> IstruzioniInvarianti;
+      std::vector<Instruction *> IstruzioniInvariantiInOrdine;
       bool NuovaInvariante = false;
 
       do {
@@ -72,6 +59,8 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
 
               if (Inserimento.second) {
                 NuovaInvariante = true;
+                IstruzioniInvariantiInOrdine.push_back(&I);
+
                 outs() << "Istruzione potenzialmente loop-invariant: ";
                 I.print(outs());
                 outs() << "\n";
@@ -84,10 +73,11 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
       BasicBlock *Preheader = L->getLoopPreheader();
 
       if (!Preheader) { continue; }
+
       std::vector<BasicBlock *> BlocchiUscita;
       L->getExitBlocks(BlocchiUscita);
 
-      for (Instruction *I : IstruzioniInvarianti) {
+      for (Instruction *I : IstruzioniInvariantiInOrdine) {
         BasicBlock *BloccoIstruzione = I->getParent();
         bool DominaTutteLeUscite = true;
 
@@ -99,15 +89,18 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
         }
 
         if (DominaTutteLeUscite) {
-          outs() << "L'istruzione domina tutte le uscite: ";
+          outs() << "Sposto nel preheader: ";
           I->print(outs());
           outs() << "\n";
-        }
 
+          I->moveBefore(Preheader->getTerminator());
+          IRModificato = true;
+        }
       }
     }
 
-    // Cambiare in PreservedAnalyses::none() appena il pass modificherà l'IR.
+    if (IRModificato) { return PreservedAnalyses::none(); }
+
     return PreservedAnalyses::all();
   }
 };
@@ -118,12 +111,12 @@ PassPluginLibraryInfo getLocalOptsPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "LocalOpts", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
-                   ArrayRef<PassBuilder::PipelineElement>) {
+                [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name == "loop-invariant-motion") {
                     FPM.addPass(LoopInvariantMotion());
                     return true;
                   }
+
                   return false;
                 });
           }};
