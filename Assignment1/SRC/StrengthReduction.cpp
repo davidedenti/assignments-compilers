@@ -43,201 +43,6 @@ using namespace llvm; // cosi' non dobbiamo scrivere "llvm::" davanti a tutto
 
 
 //===----------------------------------------------------------------------===//
-//  PASSO 1 - AlgebricIdentity
-//
-//  Elimina operazioni inutili basate su identita' algebriche:
-//      x + 0  ->  x        (e anche 0 + x -> x)
-//      x * 1  ->  x        (e anche 1 * x -> x)
-//
-//  "PassInfoMixin<...>" e' solo boilerplate del New Pass Manager: rende questa
-//  struct un passo valido. L'unica cosa importante che dobbiamo scrivere e' run().
-//===----------------------------------------------------------------------===//
-struct AlgebricIdentity : PassInfoMixin<AlgebricIdentity> {
-    // run() viene chiamata da LLVM una volta per ogni Function.
-    // Il secondo parametro (FunctionAnalysisManager) qui non ci serve, quindi
-    // non gli diamo nemmeno un nome.
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-        bool Changed = false; // diventa true se modifichiamo almeno un'istruzione
-
-        // Scorriamo tutti i Basic Block della funzione...
-        for (BasicBlock &B : F) {
-            // ...e dentro ogni blocco scorriamo tutte le istruzioni.
-            //
-            // ATTENZIONE al modo in cui iteriamo. Piu' avanti potremmo CANCELLARE
-            // l'istruzione corrente. Se cancelliamo l'elemento su cui e' puntato
-            // l'iteratore, l'iteratore diventa invalido (crash).
-            // Trucco: "*It++" fa DUE cose in un colpo solo:
-            //    1) legge l'istruzione puntata da It  (la mettiamo in I)
-            //    2) POI avanza It all'istruzione successiva
-            // Cosi', quando cancelliamo I, l'iteratore It punta gia' oltre ed e' salvo.
-            for (auto It = B.begin(); It != B.end();) {
-                Instruction &I = *It++;
-
-                // Ci interessano solo le operazioni binarie (add, sub, mul, ...).
-                // dyn_cast<T> prova a "vedere" I come un BinaryOperator:
-                //   - se I e' davvero un BinaryOperator, restituisce il puntatore
-                //   - altrimenti restituisce nullptr
-                BinaryOperator *Op = dyn_cast<BinaryOperator>(&I);
-
-                if (Op) {
-                    // ---- Caso ADDIZIONE: cerchiamo  x + 0  oppure  0 + x ----
-                    if (Op->getOpcode() == Instruction::Add) {
-                        Value *Op0 = Op->getOperand(0); // primo operando
-                        Value *Op1 = Op->getOperand(1); // secondo operando
-
-                        // Proviamo a vedere ciascun operando come costante intera.
-                        // Se non lo e', C0/C1 saranno nullptr.
-                        ConstantInt *C0 = dyn_cast<ConstantInt>(Op0);
-                        ConstantInt *C1 = dyn_cast<ConstantInt>(Op1);
-
-                        if (C0 && C0->isZero()) {
-                            // Forma  0 + x : il risultato e' semplicemente x (= Op1).
-                            // Diciamo a chiunque usasse questa add di usare Op1.
-                            Op->replaceAllUsesWith(Op1);
-                            // Ora la add non serve piu': la cancelliamo dal blocco.
-                            Op->eraseFromParent();
-                            Changed = true;
-                            continue; // passa all'istruzione successiva
-                        } else if (C1 && C1->isZero()) {
-                            // Forma  x + 0 : il risultato e' x (= Op0).
-                            Op->replaceAllUsesWith(Op0);
-                            Op->eraseFromParent();
-                            Changed = true;
-                            continue;
-                        }
-                    }
-
-                    // ---- Caso MOLTIPLICAZIONE: cerchiamo  x * 1  oppure  1 * x ----
-                    if (Op->getOpcode() == Instruction::Mul) {
-                        Value *Op0 = Op->getOperand(0);
-                        Value *Op1 = Op->getOperand(1);
-
-                        ConstantInt *C0 = dyn_cast<ConstantInt>(Op0);
-                        ConstantInt *C1 = dyn_cast<ConstantInt>(Op1);
-
-                        if (C0 && C0->isOne()) {
-                            // Forma  1 * x : il risultato e' x (= Op1).
-                            Op->replaceAllUsesWith(Op1);
-                            Op->eraseFromParent();
-                            Changed = true;
-                        } else if (C1 && C1->isOne()) {
-                            // Forma  x * 1 : il risultato e' x (= Op0).
-                            Op->replaceAllUsesWith(Op0);
-                            Op->eraseFromParent();
-                            Changed = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Valore di ritorno: comunica a LLVM se abbiamo toccato l'IR.
-        //   - PreservedAnalyses::none()  = "ho cambiato il codice, le analisi
-        //     precedenti potrebbero non essere piu' valide, ricalcolatele"
-        //   - PreservedAnalyses::all()   = "non ho cambiato niente, tutto e'
-        //     ancora valido, non buttare via le analisi"
-        if (Changed) {
-            return PreservedAnalyses::none();
-        }
-
-        return PreservedAnalyses::all();
-    }
-};
-
-
-//===----------------------------------------------------------------------===//
-//  PASSO 2 - MultiInstructionOptimization
-//
-//  Riconosce la sequenza:
-//        a = b + C        (una addizione con una costante C)
-//        c = a - C        (una sottrazione della STESSA costante C)
-//  e la semplifica in:
-//        c = b            (perche' (b + C) - C = b)
-//
-//  In pratica cerchiamo una SUB e guardiamo "all'indietro" se il suo primo
-//  operando e' una ADD compatibile.
-//===----------------------------------------------------------------------===//
-struct MultiInstructionOptimization : PassInfoMixin<MultiInstructionOptimization> {
-    PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-        bool Changed = false;
-
-        for (BasicBlock &B : F) {
-            for (auto It = B.begin(); It != B.end();) {
-                Instruction &I = *It++; // stesso trucco di prima per iterare in sicurezza
-
-                // Partiamo dalla SUB. Se l'istruzione non e' una sub, la saltiamo.
-                BinaryOperator *Sub = dyn_cast<BinaryOperator>(&I);
-                if (!Sub) { continue; }
-                if (Sub->getOpcode() != Instruction::Sub) { continue; }
-
-                Value *SubOp0 = Sub->getOperand(0); // il "minuendo"  (a)
-                Value *SubOp1 = Sub->getOperand(1); // il "sottraendo" (deve essere C)
-
-                // Il sottraendo deve essere una costante intera, altrimenti niente da fare.
-                ConstantInt *SubConstant = dyn_cast<ConstantInt>(SubOp1);
-                if (!SubConstant) { continue; }
-
-                // Il primo operando della sub (a) deve essere il RISULTATO di una add.
-                BinaryOperator *Add = dyn_cast<BinaryOperator>(SubOp0);
-                if (!Add) { continue; }
-                if (Add->getOpcode() != Instruction::Add) { continue; }
-
-                // ---- Controllo di sicurezza sui flag nsw/nuw ----
-                // "nsw" = no signed wrap, "nuw" = no unsigned wrap. Sono promesse
-                // che dicono "questa operazione NON va in overflow"; se lo fa,
-                // il risultato e' "poison" (valore avvelenato/indefinito).
-                // Per non complicarci la vita con la semantica del poison, se
-                // add o sub hanno uno di questi flag, rinunciamo (scelta prudente).
-                // NB: qui questo rende il passo conservativo (a volte non scatta),
-                //     ma non lo rende MAI sbagliato.
-                if (Add->hasNoSignedWrap() || Add->hasNoUnsignedWrap()) { continue; }
-                if (Sub->hasNoSignedWrap() || Sub->hasNoUnsignedWrap()) { continue; }
-
-                Value *AddOp0 = Add->getOperand(0);
-                Value *AddOp1 = Add->getOperand(1);
-
-                // La add puo' essere scritta come  b + C  oppure  C + b (commutativa),
-                // quindi controlliamo entrambe le posizioni per la costante.
-                ConstantInt *AddConstant0 = dyn_cast<ConstantInt>(AddOp0);
-                ConstantInt *AddConstant1 = dyn_cast<ConstantInt>(AddOp1);
-                ConstantInt *AddConstant = nullptr; // qui finira' la costante della add, se combacia
-                Value *OriginalValue = nullptr;      // qui finira' "b" (il valore non costante)
-
-                // Caso  C + b : la costante e' il primo operando; b e' il secondo.
-                // La costante della add deve essere UGUALE a quella della sub.
-                if(AddConstant0 && AddConstant0->getValue() == SubConstant->getValue()) {
-                    AddConstant = AddConstant0;
-                    OriginalValue = AddOp1; // b
-                }
-                // Caso  b + C : la costante e' il secondo operando; b e' il primo.
-                if(AddConstant1 && AddConstant1->getValue() == SubConstant->getValue()) {
-                    AddConstant = AddConstant1;
-                    OriginalValue = AddOp0; // b
-                }
-
-                // Se nessun operando della add combacia con C, non e' il nostro schema.
-                if(!AddConstant) continue;
-
-                // Trasformazione:  (b + C) - C  =>  b
-                // Tutti quelli che usavano la sub ora useranno direttamente b.
-                Sub->replaceAllUsesWith(OriginalValue);
-                Sub->eraseFromParent();
-
-                // Pulizia: se la add non e' piu' usata da NESSUNO (era usata solo
-                // dalla sub che abbiamo appena tolto), possiamo cancellarla.
-                // Se invece "a" serviva anche altrove, la lasciamo dov'e'.
-                if (Add->use_empty()) { Add->eraseFromParent(); }
-                Changed = true;
-            }
-        }
-
-        if (Changed) { return PreservedAnalyses::none(); }
-        return PreservedAnalyses::all();
-    }
-};
-
-
-//===----------------------------------------------------------------------===//
 //  FUNZIONI DI SUPPORTO PER LA STRENGTH REDUCTION
 //
 //  "Strength reduction" = sostituire un'operazione COSTOSA con una o piu'
@@ -409,7 +214,6 @@ static unsigned getMagicDivisionCost(const UnsignedDivisionByConstantInfo &Magic
     return Cost;
 }
 
-
 //===----------------------------------------------------------------------===//
 //  PASSO 3 - StrengthReduction
 //
@@ -552,7 +356,6 @@ struct StrengthReduction : PassInfoMixin<StrengthReduction> {
     }
 };
 
-
 //===----------------------------------------------------------------------===//
 //  REGISTRAZIONE DEL PLUGIN
 //
@@ -572,14 +375,6 @@ PassPluginLibraryInfo getTestPassPluginInfo() {
             PB.registerPipelineParsingCallback(
                     [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
                         // Confrontiamo il nome richiesto con i nostri tre passi.
-                        if (Name == "algebric-identity") {
-                            FPM.addPass(AlgebricIdentity());
-                            return true; // "si', ho riconosciuto e aggiunto il passo"
-                        }
-                        if (Name == "multi-instruction-optimization") {
-                            FPM.addPass(MultiInstructionOptimization());
-                            return true;
-                        }
                         if (Name == "strength-reduction") {
                             FPM.addPass(StrengthReduction());
                             return true;
