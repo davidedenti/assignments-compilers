@@ -56,20 +56,30 @@ bool areAdjacent(Loop &L0, Loop &L1) {
 
     BasicBlock *NonLoopSuccessorL0 = getNonLoopSuccessor(L0);
 
-    if (!NonLoopSuccessorL0) { return false; }
+    if (!NonLoopSuccessorL0) { 
+        return false; 
+    }
 
     BranchInst *GuardBranchL1 = L1.getLoopGuardBranch();
 
-    if (!GuardBranchL1) return false;
+    if (!GuardBranchL1) 
+        return false;
 
     BasicBlock *EntryL1 = GuardBranchL1->getParent();
 
     return NonLoopSuccessorL0 == EntryL1;
 
-  }else {
-    BasicBlock *EntryL0 = L0;
-  }
+  } else {
 
+    BasicBlock *ExitL0 = L0.getExitBlock();
+    BasicBlock *PreheaderL1 = L1.getLoopPreheader();
+
+    if (!ExitL0 || !PreheaderL1)
+        return false;
+
+    return ExitL0 == PreheaderL1;
+
+  }
 
 }
 
@@ -115,9 +125,9 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
 bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE, DependenceInfo &DI) {
   if (L0.getParentLoop() != L1.getParentLoop()) { return false; }
   if (!areAdjacent(L0, L1)) { return false; }
-  if (!haveSameTripCount(L0, L1, SE)) { return false; }
-  if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
-  if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
+//  if (!haveSameTripCount(L0, L1, SE)) { return false; }
+//  if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
+//  if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
 
   return true;
 }
@@ -162,10 +172,10 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
 
       outs() << "I loop possono essere fusi\n";
 
-      if (fuseLoops(*L0, *L1)) {
+/*       if (fuseLoops(*L0, *L1)) {
         IRModificato = true;
         break;
-      }
+      } */
     }
 
     if (IRModificato) { return PreservedAnalyses::none(); }
