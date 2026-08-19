@@ -31,22 +31,46 @@ void collectInnermostLoops(Loop *L, std::vector<Loop *> &Worklist) {
   }
 }
 
+BasicBlock *getNonLoopSuccessor(Loop &L) {
+  BranchInst *GuardBranch = L.getLoopGuardBranch();
+
+  if (!GuardBranch) { return nullptr; }
+
+  BasicBlock *Preheader = L.getLoopPreheader();
+
+  if (!Preheader) { return nullptr; }
+
+  BasicBlock *Successore0 = GuardBranch->getSuccessor(0);
+  BasicBlock *Successore1 = GuardBranch->getSuccessor(1);
+
+  if (Successore0 == Preheader) { return Successore1; }
+  if (Successore1 == Preheader) { return Successore0; }
+
+  return nullptr;
+}
+
 bool areAdjacent(Loop &L0, Loop &L1) {
   BranchInst *GuardBranchL0 = L0.getLoopGuardBranch();
 
   if (GuardBranchL0) {
-    // TODO:
-    // 1. recuperare il successore del guard che NON entra in L0;
-    // 2. verificare che sia l'entry block di L1.
-    return false;
+
+    BasicBlock *NonLoopSuccessorL0 = getNonLoopSuccessor(L0);
+
+    if (!NonLoopSuccessorL0) { return false; }
+
+    BranchInst *GuardBranchL1 = L1.getLoopGuardBranch();
+
+    if (!GuardBranchL1) return false;
+
+    BasicBlock *EntryL1 = GuardBranchL1->getParent();
+
+    return NonLoopSuccessorL0 == EntryL1;
+
+  }else {
+    BasicBlock *EntryL0 = L0;
   }
 
-  BasicBlock *ExitBlockL0 = L0.getExitBlock();
-  BasicBlock *PreheaderL1 = L1.getLoopPreheader();
 
-  if (!ExitBlockL0 || !PreheaderL1) { return false; }
-
-  return ExitBlockL0 == PreheaderL1;
 }
 
 bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
