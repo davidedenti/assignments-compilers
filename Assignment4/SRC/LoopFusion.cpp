@@ -77,7 +77,14 @@ bool areAdjacent(Loop &L0, Loop &L1) {
     if (!ExitL0 || !PreheaderL1)
         return false;
 
-    return ExitL0 == PreheaderL1;
+    if(ExitL0 == PreheaderL1) return true;
+
+    if (ExitL0->size() != 1)
+      return false;
+
+    auto *ExitBranch = dyn_cast<BranchInst>(ExitL0->getTerminator());
+    return ExitBranch && ExitBranch->isUnconditional() &&
+           ExitBranch->getSuccessor(0) == PreheaderL1;
 
   }
 
@@ -93,12 +100,24 @@ bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return TripCountL0 == TripCountL1;
 }
 
-bool areControlFlowEquivalent(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT) {
-  BasicBlock *HeaderL0 = L0.getHeader();
-  BasicBlock *HeaderL1 = L1.getHeader();
 
-  bool L0DominaL1 = DT.dominates(HeaderL0, HeaderL1);
-  bool L1PostDominaL0 = PDT.dominates(HeaderL1, HeaderL0);
+BasicBlock *getEntryBlock(Loop &L) {
+  BranchInst *GuardBranch = L.getLoopGuardBranch();
+
+  if (GuardBranch) { return GuardBranch->getParent(); }
+
+  return L.getLoopPreheader();
+}
+
+
+bool areControlFlowEquivalent(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT) {
+  BasicBlock *EntryL0 = getEntryBlock(L0);
+  BasicBlock *EntryL1 = getEntryBlock(L1);
+
+  if (!EntryL0 || !EntryL1) { return false; }
+
+  bool L0DominaL1 = DT.dominates(EntryL0, EntryL1);
+  bool L1PostDominaL0 = PDT.dominates(EntryL1, EntryL0);
 
   return L0DominaL1 && L1PostDominaL0;
 }
@@ -156,7 +175,7 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
     std::vector<Loop *> Worklist;
     bool IRModificato = false;
 
-    for (Loop *TopLevelLoop : LI) {
+    for (Loop *TopLevelLoop : llvm::reverse(LI)) {
       collectInnermostLoops(TopLevelLoop, Worklist);
     }
 
@@ -168,7 +187,10 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
       outs() << L0->getHeader()->getName() << " e ";
       outs() << L1->getHeader()->getName() << "\n";
 
-      if (!canFuse(*L0, *L1, DT, PDT, SE, DI)) { continue; }
+      if (!canFuse(*L0, *L1, DT, PDT, SE, DI)) {
+        outs() << "I loop non possono essere fusi\n";
+        continue;
+      }
 
       outs() << "I loop possono essere fusi\n";
 
