@@ -18,7 +18,11 @@ assignments-compilers/
 │   ├── SRC/
 │   ├── BUILD/
 │   └── TEST/
-└── ...             # Assignment2, 4
+├── Assignment4/
+│   ├── SRC/
+│   ├── BUILD/
+│   └── TEST/
+└── ...             # Assignment2
 ```
 
 Ogni assignment è autonomo e segue la stessa procedura di build: cambia solo il
@@ -96,3 +100,25 @@ canonica dei loop: prima del passo va eseguito `mem2reg,loop-simplify` (il passo
 esce senza fare nulla se il loop non ha un preheader).
 
 Test: `Assignment3/TEST/README.md`.
+
+### Assignment 4 — Loop Fusion
+
+Un singolo passo/plugin. Il nome ufficiale LLVM `loop-fusion` è evitato per non
+entrare in conflitto.
+
+| Ottimizzazione | Plugin (`.so`)   | Nome del passo      |
+| -------------- | ---------------- | ------------------- |
+| Loop Fusion    | `LoopFusion.so`  | `loop-fusion-pass`  |
+
+Il passo è un FunctionPass e usa le analisi **LoopInfo**, **DominatorTree**,
+**PostDominatorTree**, **ScalarEvolution** e **DependenceInfo**. Verifica le
+quattro condizioni di fusione (adiacenza, stesso trip count, control-flow
+equivalence, assenza di dipendenze a distanza negativa); la pipeline di
+preparazione è `mem2reg`.
+
+> **Stato: work in progress.** Le verifiche di legalità sono implementate e il
+> passo stampa per ogni coppia di loop innermost se è fondibile o meno. La
+> trasformazione vera e propria (`fuseLoops`) è ancora un TODO: al momento il
+> passo **non modifica l'IR** e restituisce sempre `PreservedAnalyses::all()`.
+
+Test: `Assignment4/TEST/README.md`.

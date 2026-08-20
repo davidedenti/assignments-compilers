@@ -174,6 +174,7 @@ bool fuseLoops(Loop &L0, Loop &L1) {
   // 2. sostituire gli usi dell'IV di L1 con l'IV di L0;
   // 3. modificare i branch per collegare body L0 -> body L1;
   // 4. usare il latch e l'uscita di L1 per il loop fuso.
+
   (void)L0;
   (void)L1;
 
@@ -224,8 +225,8 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
 
 } // namespace
 
-PassPluginLibraryInfo getLocalOptsPluginInfo() {
-  return {LLVM_PLUGIN_API_VERSION, "LocalOpts", LLVM_VERSION_STRING,
+PassPluginLibraryInfo getLoopFusionPluginInfo() {
+  return {LLVM_PLUGIN_API_VERSION, "LoopFusion", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM, ArrayRef<PassBuilder::PipelineElement>) {
@@ -240,5 +241,5 @@ PassPluginLibraryInfo getLocalOptsPluginInfo() {
 }
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
-  return getLocalOptsPluginInfo();
+  return getLoopFusionPluginInfo();
 }
