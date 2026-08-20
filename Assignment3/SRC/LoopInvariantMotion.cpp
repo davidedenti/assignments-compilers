@@ -18,6 +18,11 @@ using namespace llvm;
 
 namespace {
 
+// Un'istruzione e' loop-invariant se e' un'operazione binaria e ciascun
+// operando o e' definito fuori dal loop (quindi per definizione invariant),
+// oppure e' definito dentro il loop da un'istruzione gia' riconosciuta come
+// invariant in IstruzioniInvarianti. Basta un solo operando "non ancora
+// invariant" a far fallire il controllo.
 bool isReachingDefinitionFunction(Instruction &I, Loop &L, std::set<Instruction *> &IstruzioniInvarianti) {
   BinaryOperator *Op = dyn_cast<BinaryOperator>(&I);
 
@@ -44,6 +49,15 @@ bool isReachingDefinitionFunction(Instruction &I, Loop &L, std::set<Instruction 
   return true;
 }
 
+// Applica LICM a un singolo loop (e ricorsivamente ai suoi sub-loop):
+// 1) individua un punto fisso di istruzioni loop-invariant, propagando
+//    l'invarianza anche alle istruzioni che dipendono da altre istruzioni
+//    gia' riconosciute come invariant nello stesso loop;
+// 2) tra queste, sposta nel preheader solo quelle che dominano tutti i
+//    blocchi di uscita del loop, cioe' quelle sicuramente eseguite ad ogni
+//    iterazione (condizione necessaria per l'hoisting, altrimenti si
+//    rischierebbe di eseguire l'istruzione anche quando il loop non
+//    verrebbe raggiunto/completato).
 bool processLoop(Loop &L, DominatorTree &DT) {
   bool IRModificato = false;
 
@@ -114,6 +128,9 @@ bool processLoop(Loop &L, DominatorTree &DT) {
   return IRModificato;
 }
 
+// Entry point del pass: applica processLoop a ogni loop top-level della
+// funzione (i sub-loop vengono gestiti dalla ricorsione interna a
+// processLoop stesso).
 struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
@@ -134,7 +151,7 @@ struct LoopInvariantMotion : PassInfoMixin<LoopInvariantMotion> {
   }
 };
 
-} // namespace
+}
 
 PassPluginLibraryInfo getLocalOptsPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "LocalOpts", LLVM_VERSION_STRING,
