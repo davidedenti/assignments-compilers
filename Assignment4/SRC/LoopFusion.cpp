@@ -127,12 +127,29 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
     for (Instruction &I0 : *BB0) {
       for (BasicBlock *BB1 : L1.blocks()) {
         for (Instruction &I1 : *BB1) {
-          // TODO:
-          // 1. considerare solo coppie load/store rilevanti;
-          // 2. chiamare DI.depends(&I0, &I1, true);
-          // 3. se esiste una dipendenza, controllarne direzione/distanza;
-          // 4. restituire true se trovi una dipendenza backward (GT).
-          (void)DI;
+          // Per una dipendenza tra L0 e L1, una direzione GT al livello del
+          // loop significa che L1 deve usare un'iterazione precedente a
+          // quella di L0. L'ordine verrebbe invertito dalla fusione.
+          if (!I0.mayWriteToMemory() || !I1.mayReadOrWriteMemory()) {
+            continue;
+          }
+
+          std::unique_ptr<Dependence> Dipendenza = DI.depends(&I0, &I1, true);
+          if (!Dipendenza) {
+            continue;
+          }
+
+          unsigned Livello = L0.getLoopDepth();
+          if (Dipendenza->isConfused() || Dipendenza->getLevels() < Livello) {
+            outs() << "Dipendenza non determinabile\n";
+            return true;
+          }
+
+          unsigned Direzione = Dipendenza->getDirection(Livello);
+          if (Direzione & Dependence::DVEntry::GT) {
+            outs() << "Dipendenza backward\n";
+            return true;
+          }
         }
       }
     }
@@ -144,9 +161,9 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
 bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE, DependenceInfo &DI) {
   if (L0.getParentLoop() != L1.getParentLoop()) { return false; }
   if (!areAdjacent(L0, L1)) { return false; }
-//  if (!haveSameTripCount(L0, L1, SE)) { return false; }
-//  if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
-//  if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
+  if (!haveSameTripCount(L0, L1, SE)) { return false; }
+  if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
+  if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
 
   return true;
 }
