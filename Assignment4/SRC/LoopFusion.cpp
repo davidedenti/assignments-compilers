@@ -2,11 +2,12 @@
 // Assignment 4 - Loop Fusion
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -14,6 +15,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
+#include <memory>
 #include <vector>
 
 using namespace llvm;
@@ -34,7 +36,7 @@ void collectInnermostLoops(Loop *L, std::vector<Loop *> &Worklist) {
 BasicBlock *getNonLoopSuccessor(Loop &L) {
   BranchInst *GuardBranch = L.getLoopGuardBranch();
 
-  if (!GuardBranch) { return nullptr; }
+  if (!GuardBranch || !GuardBranch->isConditional()) { return nullptr; }
 
   BasicBlock *Preheader = L.getLoopPreheader();
 
@@ -49,45 +51,58 @@ BasicBlock *getNonLoopSuccessor(Loop &L) {
   return nullptr;
 }
 
+BasicBlock *getEntryBlock(Loop &L) {
+  BranchInst *GuardBranch = L.getLoopGuardBranch();
+
+  if (GuardBranch) { return GuardBranch->getParent(); }
+
+  return L.getLoopPreheader();
+}
+
+bool haveSameGuard(Loop &L0, Loop &L1) {
+  BranchInst *GuardL0 = L0.getLoopGuardBranch();
+  BranchInst *GuardL1 = L1.getLoopGuardBranch();
+
+  if (!GuardL0 || !GuardL1 || !GuardL0->isConditional() || !GuardL1->isConditional()) { return false; }
+  if (GuardL0->getCondition() != GuardL1->getCondition()) { return false; }
+
+  BasicBlock *PreheaderL0 = L0.getLoopPreheader();
+  BasicBlock *PreheaderL1 = L1.getLoopPreheader();
+
+  if (!PreheaderL0 || !PreheaderL1) { return false; }
+
+  bool PreheaderTrovatoL0 = GuardL0->getSuccessor(0) == PreheaderL0 || GuardL0->getSuccessor(1) == PreheaderL0;
+  bool PreheaderTrovatoL1 = GuardL1->getSuccessor(0) == PreheaderL1 || GuardL1->getSuccessor(1) == PreheaderL1;
+
+  if (!PreheaderTrovatoL0 || !PreheaderTrovatoL1) { return false; }
+
+  bool LoopSuSuccessoreZeroL0 = GuardL0->getSuccessor(0) == PreheaderL0;
+  bool LoopSuSuccessoreZeroL1 = GuardL1->getSuccessor(0) == PreheaderL1;
+
+  return LoopSuSuccessoreZeroL0 == LoopSuSuccessoreZeroL1;
+}
+
 bool areAdjacent(Loop &L0, Loop &L1) {
-  BranchInst *GuardBranchL0 = L0.getLoopGuardBranch();
+  BranchInst *GuardL0 = L0.getLoopGuardBranch();
+  BranchInst *GuardL1 = L1.getLoopGuardBranch();
 
-  if (GuardBranchL0) {
+  if ((GuardL0 && !GuardL1) || (!GuardL0 && GuardL1)) { return false; }
 
+  if (GuardL0 && GuardL1) {
     BasicBlock *NonLoopSuccessorL0 = getNonLoopSuccessor(L0);
+    BasicBlock *EntryL1 = GuardL1->getParent();
 
-    if (!NonLoopSuccessorL0) { 
-        return false; 
-    }
+    if (!NonLoopSuccessorL0 || !EntryL1) { return false; }
 
-    BranchInst *GuardBranchL1 = L1.getLoopGuardBranch();
-
-    if (!GuardBranchL1) 
-        return false;
-
-    BasicBlock *EntryL1 = GuardBranchL1->getParent();
-
-    return NonLoopSuccessorL0 == EntryL1;
-
-  } else {
-
-    BasicBlock *ExitL0 = L0.getExitBlock();
-    BasicBlock *PreheaderL1 = L1.getLoopPreheader();
-
-    if (!ExitL0 || !PreheaderL1)
-        return false;
-
-    if(ExitL0 == PreheaderL1) return true;
-
-    if (ExitL0->size() != 1)
-      return false;
-
-    auto *ExitBranch = dyn_cast<BranchInst>(ExitL0->getTerminator());
-    return ExitBranch && ExitBranch->isUnconditional() &&
-           ExitBranch->getSuccessor(0) == PreheaderL1;
-
+    return NonLoopSuccessorL0 == EntryL1 && L0.getExitBlock() == EntryL1;
   }
 
+  BasicBlock *ExitL0 = L0.getExitBlock();
+  BasicBlock *PreheaderL1 = L1.getLoopPreheader();
+
+  if (!ExitL0 || !PreheaderL1) { return false; }
+
+  return ExitL0 == PreheaderL1;
 }
 
 bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
@@ -99,16 +114,6 @@ bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
 
   return TripCountL0 == TripCountL1;
 }
-
-
-BasicBlock *getEntryBlock(Loop &L) {
-  BranchInst *GuardBranch = L.getLoopGuardBranch();
-
-  if (GuardBranch) { return GuardBranch->getParent(); }
-
-  return L.getLoopPreheader();
-}
-
 
 bool areControlFlowEquivalent(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT) {
   BasicBlock *EntryL0 = getEntryBlock(L0);
@@ -127,25 +132,21 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
     for (Instruction &I0 : *BB0) {
       for (BasicBlock *BB1 : L1.blocks()) {
         for (Instruction &I1 : *BB1) {
-          // Per una dipendenza tra L0 e L1, una direzione GT al livello del
-          // loop significa che L1 deve usare un'iterazione precedente a
-          // quella di L0. L'ordine verrebbe invertito dalla fusione.
-          if (!I0.mayWriteToMemory() || !I1.mayReadOrWriteMemory()) {
-            continue;
-          }
+          if (!I0.mayWriteToMemory() || !I1.mayReadOrWriteMemory()) { continue; }
 
           std::unique_ptr<Dependence> Dipendenza = DI.depends(&I0, &I1, true);
-          if (!Dipendenza) {
-            continue;
-          }
+
+          if (!Dipendenza) { continue; }
 
           unsigned Livello = L0.getLoopDepth();
+
           if (Dipendenza->isConfused() || Dipendenza->getLevels() < Livello) {
             outs() << "Dipendenza non determinabile\n";
             return true;
           }
 
           unsigned Direzione = Dipendenza->getDirection(Livello);
+
           if (Direzione & Dependence::DVEntry::GT) {
             outs() << "Dipendenza backward\n";
             return true;
@@ -161,6 +162,7 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
 bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE, DependenceInfo &DI) {
   if (L0.getParentLoop() != L1.getParentLoop()) { return false; }
   if (!areAdjacent(L0, L1)) { return false; }
+  if (L0.getLoopGuardBranch() && !haveSameGuard(L0, L1)) { return false; }
   if (!haveSameTripCount(L0, L1, SE)) { return false; }
   if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
   if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
@@ -168,15 +170,149 @@ bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, Scal
   return true;
 }
 
-bool fuseLoops(Loop &L0, Loop &L1) {
-  // TODO:
-  // 1. recuperare le induction variables di L0 e L1;
-  // 2. sostituire gli usi dell'IV di L1 con l'IV di L0;
-  // 3. modificare i branch per collegare body L0 -> body L1;
-  // 4. usare il latch e l'uscita di L1 per il loop fuso.
+void replaceInductionVariableUses(Loop &L1, PHINode *InductionL0, PHINode *InductionL1) {
+  BasicBlock *HeaderL1 = L1.getHeader();
+  BasicBlock *LatchL1 = L1.getLoopLatch();
 
-  (void)L0;
-  (void)L1;
+  for (BasicBlock *BB : L1.blocks()) {
+    if (BB == HeaderL1 || BB == LatchL1) { continue; }
+
+    for (Instruction &I : *BB) {
+      I.replaceUsesOfWith(InductionL1, InductionL0);
+    }
+  }
+}
+
+bool hasBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *Successore) {
+  if (!BloccoPartenza || !Successore) { return false; }
+
+  BranchInst *Branch = dyn_cast<BranchInst>(BloccoPartenza->getTerminator());
+
+  if (!Branch) { return false; }
+
+  for (unsigned Indice = 0; Indice < Branch->getNumSuccessors(); ++Indice) {
+    if (Branch->getSuccessor(Indice) == Successore) { return true; }
+  }
+
+  return false;
+}
+
+bool replaceBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *VecchioSuccessore, BasicBlock *NuovoSuccessore) {
+  if (!BloccoPartenza || !VecchioSuccessore || !NuovoSuccessore) { return false; }
+
+  BranchInst *Branch = dyn_cast<BranchInst>(BloccoPartenza->getTerminator());
+
+  if (!Branch) { return false; }
+
+  for (unsigned Indice = 0; Indice < Branch->getNumSuccessors(); ++Indice) {
+    if (Branch->getSuccessor(Indice) == VecchioSuccessore) {
+      Branch->setSuccessor(Indice, NuovoSuccessore);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+BasicBlock *getBody(Loop &L) {
+  BasicBlock *Header = L.getHeader();
+  BasicBlock *Latch = L.getLoopLatch();
+
+  if (!Header || !Latch) { return nullptr; }
+
+  for (BasicBlock *Successore : successors(Header)) {
+    if (L.contains(Successore) && Successore != Latch) { return Successore; }
+  }
+
+  return nullptr;
+}
+
+bool hasPhiNodes(BasicBlock *BB) {
+  if (!BB || BB->empty()) { return false; }
+
+  return isa<PHINode>(&BB->front());
+}
+
+bool fuseNonGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
+  if (L0.getLoopGuardBranch() || L1.getLoopGuardBranch()) { return false; }
+
+  PHINode *InductionL0 = L0.getInductionVariable(SE);
+  PHINode *InductionL1 = L1.getInductionVariable(SE);
+
+  if (!InductionL0 || !InductionL1) { return false; }
+
+  BasicBlock *BodyL0 = getBody(L0);
+  BasicBlock *BodyL1 = getBody(L1);
+  BasicBlock *LatchL0 = L0.getLoopLatch();
+  BasicBlock *LatchL1 = L1.getLoopLatch();
+  BasicBlock *ExitingBlockL0 = L0.getExitingBlock();
+  BasicBlock *PreheaderL1 = L1.getLoopPreheader();
+  BasicBlock *ExitBlockL1 = L1.getExitBlock();
+
+  if (!BodyL0 || !BodyL1 || !LatchL0 || !LatchL1 || !ExitingBlockL0 || !PreheaderL1 || !ExitBlockL1) { return false; }
+  if (L0.getExitBlock() != PreheaderL1) { return false; }
+
+  if (hasPhiNodes(BodyL1) || hasPhiNodes(LatchL0) || hasPhiNodes(LatchL1) || hasPhiNodes(ExitBlockL1)) { return false; }
+
+  if (!hasBranchSuccessor(BodyL0, LatchL0)) { return false; }
+  if (!hasBranchSuccessor(BodyL1, LatchL1)) { return false; }
+  if (!hasBranchSuccessor(ExitingBlockL0, PreheaderL1)) { return false; }
+
+  replaceInductionVariableUses(L1, InductionL0, InductionL1);
+
+  replaceBranchSuccessor(BodyL0, LatchL0, BodyL1);
+  replaceBranchSuccessor(BodyL1, LatchL1, LatchL0);
+  replaceBranchSuccessor(ExitingBlockL0, PreheaderL1, ExitBlockL1);
+
+  return true;
+}
+
+bool fuseGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
+  BranchInst *GuardL0 = L0.getLoopGuardBranch();
+  BranchInst *GuardL1 = L1.getLoopGuardBranch();
+
+  if (!GuardL0 || !GuardL1 || !haveSameGuard(L0, L1)) { return false; }
+
+  PHINode *InductionL0 = L0.getInductionVariable(SE);
+  PHINode *InductionL1 = L1.getInductionVariable(SE);
+
+  if (!InductionL0 || !InductionL1) { return false; }
+
+  BasicBlock *BodyL0 = getBody(L0);
+  BasicBlock *BodyL1 = getBody(L1);
+  BasicBlock *LatchL0 = L0.getLoopLatch();
+  BasicBlock *LatchL1 = L1.getLoopLatch();
+  BasicBlock *ExitingBlockL0 = L0.getExitingBlock();
+  BasicBlock *EntryL1 = GuardL1->getParent();
+  BasicBlock *ExitBlockL1 = L1.getExitBlock();
+
+  if (!BodyL0 || !BodyL1 || !LatchL0 || !LatchL1 || !ExitingBlockL0 || !EntryL1 || !ExitBlockL1) { return false; }
+  if (L0.getExitBlock() != EntryL1) { return false; }
+
+  if (hasPhiNodes(BodyL1) || hasPhiNodes(LatchL0) || hasPhiNodes(LatchL1) || hasPhiNodes(EntryL1) || hasPhiNodes(ExitBlockL1)) { return false; }
+
+  if (!hasBranchSuccessor(BodyL0, LatchL0)) { return false; }
+  if (!hasBranchSuccessor(BodyL1, LatchL1)) { return false; }
+  if (!hasBranchSuccessor(ExitingBlockL0, EntryL1)) { return false; }
+  if (!hasBranchSuccessor(GuardL0->getParent(), EntryL1)) { return false; }
+
+  replaceInductionVariableUses(L1, InductionL0, InductionL1);
+
+  replaceBranchSuccessor(BodyL0, LatchL0, BodyL1);
+  replaceBranchSuccessor(BodyL1, LatchL1, LatchL0);
+
+  replaceBranchSuccessor(ExitingBlockL0, EntryL1, ExitBlockL1);
+  replaceBranchSuccessor(GuardL0->getParent(), EntryL1, ExitBlockL1);
+
+  return true;
+}
+
+bool fuseLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
+  BranchInst *GuardL0 = L0.getLoopGuardBranch();
+  BranchInst *GuardL1 = L1.getLoopGuardBranch();
+
+  if (GuardL0 && GuardL1) { return fuseGuardedLoops(L0, L1, SE); }
+  if (!GuardL0 && !GuardL1) { return fuseNonGuardedLoops(L0, L1, SE); }
 
   return false;
 }
@@ -211,10 +347,10 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
 
       outs() << "I loop possono essere fusi\n";
 
-/*       if (fuseLoops(*L0, *L1)) {
+      if (fuseLoops(*L0, *L1, SE)) {
         IRModificato = true;
         break;
-      } */
+      }
     }
 
     if (IRModificato) { return PreservedAnalyses::none(); }
