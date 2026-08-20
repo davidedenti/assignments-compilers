@@ -111,14 +111,17 @@ entrare in conflitto.
 | Loop Fusion    | `LoopFusion.so`  | `loop-fusion-pass`  |
 
 Il passo è un FunctionPass e usa le analisi **LoopInfo**, **DominatorTree**,
-**PostDominatorTree**, **ScalarEvolution** e **DependenceInfo**. Verifica le
-quattro condizioni di fusione (adiacenza, stesso trip count, control-flow
-equivalence, assenza di dipendenze a distanza negativa); la pipeline di
-preparazione è `mem2reg`.
+**PostDominatorTree** e **ScalarEvolution**. Verifica le quattro condizioni di
+fusione (adiacenza, stesso trip count, control-flow equivalence, assenza di
+dipendenze a distanza negativa, queste ultime via SCEV) e poi fonde. La pipeline
+di preparazione è `mem2reg,loop-simplify`.
 
-> **Stato: work in progress.** Le verifiche di legalità sono implementate e il
-> passo stampa per ogni coppia di loop innermost se è fondibile o meno. La
-> trasformazione vera e propria (`fuseLoops`) è ancora un TODO: al momento il
-> passo **non modifica l'IR** e restituisce sempre `PreservedAnalyses::all()`.
+> **Ambito.** Il passo gestisce sia loop **non guarded (top-tested)** sia loop
+> **guarded (ruotati)**: sceglie la strada in base a `getLoopGuardBranch()`.
+> L'induction variable è recuperata con `getInductionVariable` (forma ruotata) e,
+> in fallback, `getCanonicalInductionVariable` (forma top-tested). Fonde una
+> coppia per esecuzione del passo: per collassare più loop adiacenti si rilancia
+> il passo. I test usano la forma top-tested (`mem2reg,loop-simplify`, senza
+> `loop-rotate`).
 
 Test: `Assignment4/TEST/README.md`.

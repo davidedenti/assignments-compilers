@@ -1,12 +1,16 @@
 //===----------------------------------------------------------------------===//
 // Assignment 4 - Loop Fusion
+//
+// Gestisce sia loop non guarded (top-tested) sia loop guarded (ruotati).
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Analysis/DependenceAnalysis.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -15,7 +19,7 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
-#include <memory>
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <vector>
 
 using namespace llvm;
@@ -31,6 +35,16 @@ void collectInnermostLoops(Loop *L, std::vector<Loop *> &Worklist) {
   for (Loop *SottoLoop : L->getSubLoops()) {
     collectInnermostLoops(SottoLoop, Worklist);
   }
+}
+
+// Recupera l'induction variable in modo robusto per entrambe le forme di loop:
+// - loop guarded/ruotati: getInductionVariable(SE) (confronto nel latch);
+// - loop non guarded/top-tested: getInductionVariable e' nullo, si ripiega su
+//   getCanonicalInductionVariable() (IV canonica {0,+,1} nell'header).
+PHINode *getInduction(Loop &L, ScalarEvolution &SE) {
+  if (PHINode *IV = L.getInductionVariable(SE)) { return IV; }
+
+  return L.getCanonicalInductionVariable();
 }
 
 BasicBlock *getNonLoopSuccessor(Loop &L) {
@@ -82,6 +96,13 @@ bool haveSameGuard(Loop &L0, Loop &L1) {
   return LoopSuSuccessoreZeroL0 == LoopSuSuccessoreZeroL1;
 }
 
+//===----------------------------------------------------------------------===//
+// Verifica delle condizioni di fusione
+//===----------------------------------------------------------------------===//
+
+// 1) Adiacenza. Per loop guarded il successore non-loop della guardia di L0 deve
+//    essere l'entry di L1; per loop non guarded l'exit block di L0 deve
+//    coincidere con il preheader di L1.
 bool areAdjacent(Loop &L0, Loop &L1) {
   BranchInst *GuardL0 = L0.getLoopGuardBranch();
   BranchInst *GuardL1 = L1.getLoopGuardBranch();
@@ -101,10 +122,19 @@ bool areAdjacent(Loop &L0, Loop &L1) {
   BasicBlock *PreheaderL1 = L1.getLoopPreheader();
 
   if (!ExitL0 || !PreheaderL1) { return false; }
+  if (ExitL0 != PreheaderL1) { return false; }
 
-  return ExitL0 == PreheaderL1;
+  // Il blocco che collega i due loop deve contenere solo il branch: se c'e'
+  // un'altra istruzione (es. uno store) allora tra i loop viene eseguito del
+  // codice e i loop NON sono adiacenti.
+  for (Instruction &I : *ExitL0) {
+    if (!isa<PHINode>(&I) && !I.isTerminator()) { return false; }
+  }
+
+  return true;
 }
 
+// 2) Stesso trip count, tramite ScalarEvolution.
 bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   const SCEV *TripCountL0 = SE.getBackedgeTakenCount(&L0);
   const SCEV *TripCountL1 = SE.getBackedgeTakenCount(&L1);
@@ -115,6 +145,7 @@ bool haveSameTripCount(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return TripCountL0 == TripCountL1;
 }
 
+// 3) Control-flow equivalence: L0 domina L1 e L1 post-domina L0.
 bool areControlFlowEquivalent(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT) {
   BasicBlock *EntryL0 = getEntryBlock(L0);
   BasicBlock *EntryL1 = getEntryBlock(L1);
@@ -127,48 +158,102 @@ bool areControlFlowEquivalent(Loop &L0, Loop &L1, DominatorTree &DT, PostDominat
   return L0DominaL1 && L1PostDominaL0;
 }
 
-bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, DependenceInfo &DI) {
-  for (BasicBlock *BB0 : L0.blocks()) {
-    for (Instruction &I0 : *BB0) {
-      for (BasicBlock *BB1 : L1.blocks()) {
-        for (Instruction &I1 : *BB1) {
-          if (!I0.mayWriteToMemory() || !I1.mayReadOrWriteMemory()) { continue; }
+// 4) Dipendenze a distanza negativa, via SCEV (indipendente dalla forma del
+//    loop). Per ogni scrittura di L0 e ogni accesso di L1 allo STESSO array, si
+//    confronta l'indirizzo di partenza (iterazione 0) dei rispettivi
+//    add-recurrence. Se il secondo loop accede a un elemento con offset dello
+//    stesso segno del passo (un elemento che il primo loop produce in
+//    un'iterazione futura), la fusione invertirebbe l'ordine -> vietata.
+//
+//    Due alloca distinti non aliasano, quindi accessi ad array diversi sono
+//    indipendenti; con puntatori che potrebbero aliasare questo controllo
+//    sarebbe insufficiente.
+bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, ScalarEvolution &SE) {
+  SmallVector<Instruction *, 8> ScrittureL0;
+  SmallVector<Instruction *, 8> AccessiL1;
 
-          std::unique_ptr<Dependence> Dipendenza = DI.depends(&I0, &I1, true);
+  for (BasicBlock *BB : L0.blocks()) {
+    for (Instruction &I : *BB) {
+      if (isa<StoreInst>(&I)) { ScrittureL0.push_back(&I); }
+    }
+  }
 
-          if (!Dipendenza) { continue; }
+  for (BasicBlock *BB : L1.blocks()) {
+    for (Instruction &I : *BB) {
+      if (getLoadStorePointerOperand(&I)) { AccessiL1.push_back(&I); }
+    }
+  }
 
-          unsigned Livello = L0.getLoopDepth();
+  for (Instruction *Scrittura : ScrittureL0) {
+    Value *PtrScrittura = getLoadStorePointerOperand(Scrittura);
+    const SCEV *ScevScrittura = SE.getSCEV(PtrScrittura);
+    const auto *ArScrittura = dyn_cast<SCEVAddRecExpr>(ScevScrittura);
 
-          if (Dipendenza->isConfused() || Dipendenza->getLevels() < Livello) {
-            outs() << "Dipendenza non determinabile\n";
-            return true;
-          }
+    if (!ArScrittura || !ArScrittura->isAffine()) {
+      outs() << "Dipendenza non determinabile\n";
+      return true;
+    }
 
-          unsigned Direzione = Dipendenza->getDirection(Livello);
+    for (Instruction *Accesso : AccessiL1) {
+      Value *PtrAccesso = getLoadStorePointerOperand(Accesso);
 
-          if (Direzione & Dependence::DVEntry::GT) {
-            outs() << "Dipendenza backward\n";
-            return true;
-          }
-        }
+      // Array diversi (alloca distinti) -> nessuna dipendenza.
+      if (getUnderlyingObject(PtrScrittura) != getUnderlyingObject(PtrAccesso)) {
+        continue;
       }
+
+      const SCEV *ScevAccesso = SE.getSCEV(PtrAccesso);
+      const auto *ArAccesso = dyn_cast<SCEVAddRecExpr>(ScevAccesso);
+
+      if (!ArAccesso || !ArAccesso->isAffine()) {
+        outs() << "Dipendenza non determinabile\n";
+        return true;
+      }
+
+      const SCEV *PassoScrittura = ArScrittura->getStepRecurrence(SE);
+      const SCEV *PassoAccesso = ArAccesso->getStepRecurrence(SE);
+
+      if (PassoScrittura != PassoAccesso) {
+        outs() << "Dipendenza non determinabile\n";
+        return true;
+      }
+
+      // Delta = start(L1) - start(L0). Prodotto col passo > 0 significa stesso
+      // segno: L1 accede in avanti rispetto a cio' che L0 scrive.
+      const SCEV *Delta = SE.getMinusSCEV(ArAccesso->getStart(), ArScrittura->getStart());
+      const SCEV *Prodotto = SE.getMulExpr(Delta, PassoScrittura);
+
+      if (SE.isKnownPositive(Prodotto)) {
+        outs() << "Dipendenza backward\n";
+        return true;
+      }
+
+      if (SE.isKnownNonPositive(Prodotto)) {
+        continue; // distanza 0 o all'indietro: sicuro
+      }
+
+      outs() << "Dipendenza non determinabile\n";
+      return true;
     }
   }
 
   return false;
 }
 
-bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE, DependenceInfo &DI) {
+bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE) {
   if (L0.getParentLoop() != L1.getParentLoop()) { return false; }
   if (!areAdjacent(L0, L1)) { return false; }
   if (L0.getLoopGuardBranch() && !haveSameGuard(L0, L1)) { return false; }
   if (!haveSameTripCount(L0, L1, SE)) { return false; }
   if (!areControlFlowEquivalent(L0, L1, DT, PDT)) { return false; }
-  if (hasNegativeDistanceDependence(L0, L1, DI)) { return false; }
+  if (hasNegativeDistanceDependence(L0, L1, SE)) { return false; }
 
   return true;
 }
+
+//===----------------------------------------------------------------------===//
+// Trasformazione del codice
+//===----------------------------------------------------------------------===//
 
 void replaceInductionVariableUses(Loop &L1, PHINode *InductionL0, PHINode *InductionL1) {
   BasicBlock *HeaderL1 = L1.getHeader();
@@ -236,8 +321,8 @@ bool hasPhiNodes(BasicBlock *BB) {
 bool fuseNonGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   if (L0.getLoopGuardBranch() || L1.getLoopGuardBranch()) { return false; }
 
-  PHINode *InductionL0 = L0.getInductionVariable(SE);
-  PHINode *InductionL1 = L1.getInductionVariable(SE);
+  PHINode *InductionL0 = getInduction(L0, SE);
+  PHINode *InductionL1 = getInduction(L1, SE);
 
   if (!InductionL0 || !InductionL1) { return false; }
 
@@ -273,8 +358,8 @@ bool fuseGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
 
   if (!GuardL0 || !GuardL1 || !haveSameGuard(L0, L1)) { return false; }
 
-  PHINode *InductionL0 = L0.getInductionVariable(SE);
-  PHINode *InductionL1 = L1.getInductionVariable(SE);
+  PHINode *InductionL0 = getInduction(L0, SE);
+  PHINode *InductionL1 = getInduction(L1, SE);
 
   if (!InductionL0 || !InductionL1) { return false; }
 
@@ -323,7 +408,6 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
     DominatorTree &DT = AM.getResult<DominatorTreeAnalysis>(F);
     PostDominatorTree &PDT = AM.getResult<PostDominatorTreeAnalysis>(F);
     ScalarEvolution &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-    DependenceInfo &DI = AM.getResult<DependenceAnalysis>(F);
 
     std::vector<Loop *> Worklist;
     bool IRModificato = false;
@@ -340,7 +424,7 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
       outs() << L0->getHeader()->getName() << " e ";
       outs() << L1->getHeader()->getName() << "\n";
 
-      if (!canFuse(*L0, *L1, DT, PDT, SE, DI)) {
+      if (!canFuse(*L0, *L1, DT, PDT, SE)) {
         outs() << "I loop non possono essere fusi\n";
         continue;
       }
@@ -349,11 +433,16 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
 
       if (fuseLoops(*L0, *L1, SE)) {
         IRModificato = true;
+        // Worklist e analisi ora sono stale: fondere altre coppie richiede un
+        // nuovo run del passo.
         break;
       }
     }
 
-    if (IRModificato) { return PreservedAnalyses::none(); }
+    if (IRModificato) {
+      EliminateUnreachableBlocks(F);
+      return PreservedAnalyses::none();
+    }
 
     return PreservedAnalyses::all();
   }
