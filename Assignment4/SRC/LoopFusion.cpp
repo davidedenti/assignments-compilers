@@ -174,7 +174,6 @@ bool fuseLoops(Loop &L0, Loop &L1) {
   // 2. sostituire gli usi dell'IV di L1 con l'IV di L0;
   // 3. modificare i branch per collegare body L0 -> body L1;
   // 4. usare il latch e l'uscita di L1 per il loop fuso.
-
   (void)L0;
   (void)L1;
 
