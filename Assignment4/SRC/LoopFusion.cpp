@@ -27,19 +27,23 @@ using namespace llvm;
 namespace {
 
 void collectInnermostLoops(Loop *L, std::vector<Loop *> &Worklist) {
+  // Se questo loop non contiene altri loop al suo interno (è "il più interno"),
+  // lo aggiungiamo alla lista dei risultati e ci fermiamo
   if (L->isInnermost()) {
     Worklist.push_back(L);
     return;
   }
 
+  // Altrimenti, il loop contiene altri loop annidati:
+  // ripetiamo lo stesso controllo su ciascuno di essi (ricorsione)
   for (Loop *SottoLoop : L->getSubLoops()) {
     collectInnermostLoops(SottoLoop, Worklist);
   }
 }
 
-// Recupera l'induction variable in modo robusto per entrambe le forme di loop:
-// - loop guarded/ruotati: getInductionVariable(SE) (confronto nel latch);
-// - loop non guarded/top-tested: getInductionVariable e' nullo, si ripiega su
+// Recupera l'induction variable per entrambe le forme di loop:
+// - loop guarded: getInductionVariable(SE) (confronto nel latch);
+// - loop non guarded: getInductionVariable e' nullo, si ripiega su
 //   getCanonicalInductionVariable() (IV canonica {0,+,1} nell'header).
 PHINode *getInduction(Loop &L, ScalarEvolution &SE) {
   if (PHINode *IV = L.getInductionVariable(SE)) { return IV; }
@@ -48,28 +52,38 @@ PHINode *getInduction(Loop &L, ScalarEvolution &SE) {
 }
 
 BasicBlock *getNonLoopSuccessor(Loop &L) {
+  // Prende il guard branch che decide se entrare nel loop o saltarlo del tutto
   BranchInst *GuardBranch = L.getLoopGuardBranch();
 
+  // Se non esiste, o non ha due possibili destinazioni, non possiamo procedere
   if (!GuardBranch || !GuardBranch->isConditional()) { return nullptr; }
 
+  // Il preheader è il blocco che porta dentro il loop
   BasicBlock *Preheader = L.getLoopPreheader();
 
+  // Senza preheader non possiamo capire quale sia la strada "dentro" il loop
   if (!Preheader) { return nullptr; }
 
+  // Il branch condizionale ha due possibili destinazioni: le prendiamo entrambe
   BasicBlock *Successore0 = GuardBranch->getSuccessor(0);
   BasicBlock *Successore1 = GuardBranch->getSuccessor(1);
 
+  // Se una delle due destinazioni è il preheader,
+  // allora l'altra è la strada in uscita dal loop: return
   if (Successore0 == Preheader) { return Successore1; }
-  if (Successore1 == Preheader) { return Successore0; }
+  else if (Successore1 == Preheader) { return Successore0; }
 
+  // Nessuna delle due destinazioni porta al preheader
   return nullptr;
 }
 
 BasicBlock *getEntryBlock(Loop &L) {
   BranchInst *GuardBranch = L.getLoopGuardBranch();
 
+  // Se il guard branch esiste, il blocco che lo contiene è il vero punto d'ingresso "logico" del loop
   if (GuardBranch) { return GuardBranch->getParent(); }
 
+  // Altrimenti il punto d'ingresso è semplicemente il preheader
   return L.getLoopPreheader();
 }
 
@@ -77,22 +91,32 @@ bool haveSameGuard(Loop &L0, Loop &L1) {
   BranchInst *GuardL0 = L0.getLoopGuardBranch();
   BranchInst *GuardL1 = L1.getLoopGuardBranch();
 
+  // Se manca un guard branch, o non è condizionale, i due loop non possono avere lo stesso guard branch
   if (!GuardL0 || !GuardL1 || !GuardL0->isConditional() || !GuardL1->isConditional()) { return false; }
+
+  // I due guard branch devono controllare esattamente la stessa condizione (stesso valore/espressione)
   if (GuardL0->getCondition() != GuardL1->getCondition()) { return false; }
 
+  // Recuperiamo i preheader (blocco d'ingresso) di entrambi i loop
   BasicBlock *PreheaderL0 = L0.getLoopPreheader();
   BasicBlock *PreheaderL1 = L1.getLoopPreheader();
 
+  // Senza preheader non possiamo verificare la struttura del branch
   if (!PreheaderL0 || !PreheaderL1) { return false; }
 
+  // Verifichiamo che uno dei due successori del branch porti davvero al preheader
+  // (cioè che la guardia porti effettivamente dentro al rispettivo loop)
   bool PreheaderTrovatoL0 = GuardL0->getSuccessor(0) == PreheaderL0 || GuardL0->getSuccessor(1) == PreheaderL0;
   bool PreheaderTrovatoL1 = GuardL1->getSuccessor(0) == PreheaderL1 || GuardL1->getSuccessor(1) == PreheaderL1;
 
   if (!PreheaderTrovatoL0 || !PreheaderTrovatoL1) { return false; }
 
+  // Controlliamo se il preheader si trova nella "stessa posizione" (successore 0 oppure 1)
+  // in entrambi i branch, cioè se hanno la stessa "polarità" (es. entrambi: "se vero entra nel loop")
   bool LoopSuSuccessoreZeroL0 = GuardL0->getSuccessor(0) == PreheaderL0;
   bool LoopSuSuccessoreZeroL1 = GuardL1->getSuccessor(0) == PreheaderL1;
 
+  // Le due guardie sono "uguali" solo se condizione E polarità coincidono
   return LoopSuSuccessoreZeroL0 == LoopSuSuccessoreZeroL1;
 }
 
@@ -100,7 +124,7 @@ bool haveSameGuard(Loop &L0, Loop &L1) {
 // Verifica delle condizioni di fusione
 //===----------------------------------------------------------------------===//
 
-// 1) Adiacenza. Per loop guarded il successore non-loop della guardia di L0 deve
+// 1) Adiacenza. Per loop guarded il successore non-loop del guard branch di L0 deve
 //    essere l'entry di L1; per loop non guarded l'exit block di L0 deve
 //    coincidere con il preheader di L1.
 bool areAdjacent(Loop &L0, Loop &L1) {
@@ -240,6 +264,8 @@ bool hasNegativeDistanceDependence(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return false;
 }
 
+// Applica in sequenza tutte le condizioni necessarie alla fusione: se anche
+// una sola fallisce, i due loop non possono essere fusi.
 bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, ScalarEvolution &SE) {
   if (L0.getParentLoop() != L1.getParentLoop()) { return false; }
   if (!areAdjacent(L0, L1)) { return false; }
@@ -255,6 +281,9 @@ bool canFuse(Loop &L0, Loop &L1, DominatorTree &DT, PostDominatorTree &PDT, Scal
 // Trasformazione del codice
 //===----------------------------------------------------------------------===//
 
+// Dopo la fusione, L1 non ha piu' una propria induction variable: tutti gli
+// usi della IV di L1 nel corpo (escludendo header e latch, che vengono
+// eliminati/ricollegati separatamente) vengono sostituiti con la IV di L0.
 void replaceInductionVariableUses(Loop &L1, PHINode *InductionL0, PHINode *InductionL1) {
   BasicBlock *HeaderL1 = L1.getHeader();
   BasicBlock *LatchL1 = L1.getLoopLatch();
@@ -268,6 +297,8 @@ void replaceInductionVariableUses(Loop &L1, PHINode *InductionL0, PHINode *Induc
   }
 }
 
+// Verifica se il terminatore di BloccoPartenza e' un branch (condizionale o
+// meno) che ha Successore tra le proprie destinazioni.
 bool hasBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *Successore) {
   if (!BloccoPartenza || !Successore) { return false; }
 
@@ -282,6 +313,9 @@ bool hasBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *Successore) {
   return false;
 }
 
+// Cerca VecchioSuccessore tra le destinazioni del branch che termina
+// BloccoPartenza e, se lo trova, lo rimpiazza con NuovoSuccessore. E' cosi'
+// che il CFG viene "ricablato" durante la fusione.
 bool replaceBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *VecchioSuccessore, BasicBlock *NuovoSuccessore) {
   if (!BloccoPartenza || !VecchioSuccessore || !NuovoSuccessore) { return false; }
 
@@ -299,6 +333,9 @@ bool replaceBranchSuccessor(BasicBlock *BloccoPartenza, BasicBlock *VecchioSucce
   return false;
 }
 
+// Il "body" e' il blocco eseguito dall'header quando la condizione del loop
+// e' vera, cioe' il successore dell'header interno al loop e diverso dal
+// latch (assumendo la forma canonica header -> body -> latch).
 BasicBlock *getBody(Loop &L) {
   BasicBlock *Header = L.getHeader();
   BasicBlock *Latch = L.getLoopLatch();
@@ -312,12 +349,18 @@ BasicBlock *getBody(Loop &L) {
   return nullptr;
 }
 
+// I PHI node, se presenti, si trovano sempre in testa al blocco: basta
+// controllare la prima istruzione.
 bool hasPhiNodes(BasicBlock *BB) {
   if (!BB || BB->empty()) { return false; }
 
   return isa<PHINode>(&BB->front());
 }
 
+// Fonde due loop top-tested (senza guard branch). Il body di L0 viene
+// ricollegato al body di L1, il latch di L1 al latch di L0, e l'exiting
+// block di L0 punta direttamente all'exit block di L1: il risultato e' un
+// unico loop che esegue in sequenza il corpo di entrambi ad ogni iterazione.
 bool fuseNonGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   if (L0.getLoopGuardBranch() || L1.getLoopGuardBranch()) { return false; }
 
@@ -352,6 +395,10 @@ bool fuseNonGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return true;
 }
 
+// Fonde due loop guarded (con guard branch). Rispetto al caso non guarded va
+// ricollegato anche il guard branch di L0: sia l'exiting block di L0 sia il
+// blocco del guard branch di L0 devono saltare l'entry di L1 (ormai fusa) e
+// puntare direttamente all'exit block di L1.
 bool fuseGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   BranchInst *GuardL0 = L0.getLoopGuardBranch();
   BranchInst *GuardL1 = L1.getLoopGuardBranch();
@@ -392,6 +439,10 @@ bool fuseGuardedLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return true;
 }
 
+// Dispatcher: sceglie la strategia di fusione giusta in base alla forma dei
+// due loop. Il caso misto (un loop guarded e l'altro no) non e' gestito: a
+// quel punto areAdjacent avrebbe gia' restituito false, quindi canFuse non
+// avrebbe permesso di arrivare qui.
 bool fuseLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   BranchInst *GuardL0 = L0.getLoopGuardBranch();
   BranchInst *GuardL1 = L1.getLoopGuardBranch();
@@ -402,6 +453,11 @@ bool fuseLoops(Loop &L0, Loop &L1, ScalarEvolution &SE) {
   return false;
 }
 
+// Entry point del pass: raccoglie tutti i loop piu' interni della funzione e
+// prova a fondere coppie di loop adiacenti nella worklist. Ci si ferma alla
+// prima fusione riuscita perche' modifica il CFG e rende stale sia la
+// worklist sia le analisi (LoopInfo, dominator tree, ecc.): eventuali altre
+// coppie fondibili verranno gestite in un run successivo del pass.
 struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
     LoopInfo &LI = AM.getResult<LoopAnalysis>(F);
@@ -448,7 +504,7 @@ struct LoopFusionPass : PassInfoMixin<LoopFusionPass> {
   }
 };
 
-} // namespace
+}
 
 PassPluginLibraryInfo getLoopFusionPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "LoopFusion", LLVM_VERSION_STRING,
