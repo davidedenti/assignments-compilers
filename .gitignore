@@ -3,4 +3,6 @@
 **/BUILD/
 *.ll
 *.fun.dot
+Assignment2/SRC/
+Assignment2/TEST/
 CMakeLists.txt
