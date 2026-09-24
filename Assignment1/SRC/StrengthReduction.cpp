@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// StrengthReduction implementation
+// StrengthReduction
 //-----------------------------------------------------------------------------
 // Passo che sostituisce mul e udiv per costante con operazioni piu' economiche.
 // Scenari ottimizzabili e relativa trasformazione:
@@ -8,7 +8,6 @@
   x * 15  --> (x << 4) - x      (costante del tipo 2^k - 1)
   x * C   --> somma di shift    (caso generale, un termine per ogni bit a 1)
   x / 8   --> x >> 3            (divisore potenza di 2)
-  x / C   --> numeri magici     (divisore generico)
 */
 // La trasformazione viene applicata solo se un modello di costo indicativo
 // dice che la sequenza sostitutiva costa meno dell'operazione originale.
@@ -20,7 +19,6 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
-#include "llvm/Support/DivisionByConstantInfo.h"
 
 using namespace llvm;
 
@@ -116,41 +114,6 @@ static Value *createMultiplyByConstant(IRBuilder<> &Builder, Value *ValueToMulti
     return Result;
 }
 
-// Meta' alta del prodotto Dividend * Magic (MULHU), usata dalla divisione con
-// numeri magici: si allarga a 2N bit con ZExt, si moltiplica, si prendono i bit
-// alti con uno shift e si tronca di nuovo a N bit.
-static Value *createUnsignedMultiplyHigh(IRBuilder<> &Builder, Value *Dividend, const APInt &Magic) {
-    IntegerType *Type = dyn_cast<IntegerType>(Dividend->getType());
-    unsigned BitWidth = Type->getBitWidth();
-    IntegerType *WideType = IntegerType::get(Builder.getContext(), BitWidth * 2);
-
-    Value *WideDividend = Builder.CreateZExt(Dividend, WideType, "magic.dividend");
-    Value *WideMagic = ConstantInt::get(WideType, Magic.zext(BitWidth * 2));
-    Value *Product = Builder.CreateMul(WideDividend, WideMagic, "magic.product");
-    Value *HighHalf = Builder.CreateLShr(Product, BitWidth, "magic.high");
-
-    return Builder.CreateTrunc(HighHalf, Type, "magic.quotient");
-}
-
-// Costo stimato della divisione tramite numero magico, da confrontare con la UDiv
-static unsigned getMagicDivisionCost(const UnsignedDivisionByConstantInfo &Magic) {
-    // Costo base: moltiplicazione alta + shift
-    unsigned Cost = getInstructionCost(Instruction::Mul) + getInstructionCost(Instruction::LShr);
-
-    if (Magic.PreShift != 0) { Cost += getInstructionCost(Instruction::LShr); }
-
-    // Ramo di correzione richiesto da certi divisori: sub + shift + add
-    if (Magic.IsAdd) {
-        Cost += getInstructionCost(Instruction::Sub);
-        Cost += getInstructionCost(Instruction::LShr);
-        Cost += getInstructionCost(Instruction::Add);
-    }
-
-    if (Magic.PostShift != 0) { Cost += getInstructionCost(Instruction::LShr); }
-
-    return Cost;
-}
-
 struct StrengthReduction : PassInfoMixin<StrengthReduction> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
         bool Changed = false;
@@ -210,53 +173,19 @@ struct StrengthReduction : PassInfoMixin<StrengthReduction> {
                 if (!Divisor || Divisor->isZero() || Divisor->isOne()) { continue; }
 
                 const APInt &DivisorValue = Divisor->getValue();
+
+                // Si gestiscono solo le potenze di 2: x / 2^k = x >> k
+                // Gli altri divisori restano una udiv
+                if (!DivisorValue.isPowerOf2()) { continue; }
+
+                unsigned Shift = DivisorValue.logBase2();
+
+                if (!isProfitable(Instruction::UDiv, getInstructionCost(Instruction::LShr))) { continue; }
+
                 IRBuilder<> Builder(Op);
+                Value *Replacement = Builder.CreateLShr(Dividend, Shift, "strength.lshr");
 
-                // Divisore potenza di 2: x / 2^k = x >> k
-                if (DivisorValue.isPowerOf2()) {
-                    unsigned Shift = DivisorValue.logBase2();
-
-                    if (!isProfitable(Instruction::UDiv, getInstructionCost(Instruction::LShr))) { continue; }
-
-                    Value *Replacement = Builder.CreateLShr(Dividend, Shift, "strength.lshr");
-
-                    Op->replaceAllUsesWith(Replacement);
-                    Op->eraseFromParent();
-                    Changed = true;
-                    continue;
-                }
-
-                // Divisore generico: si moltiplica per un numero magico e si prendono
-                // i bit alti del prodotto, con pre-shift, correzione e post-shift.
-                // I parametri sono calcolati da UnsignedDivisionByConstantInfo.
-                UnsignedDivisionByConstantInfo Magic = UnsignedDivisionByConstantInfo::get(DivisorValue);
-                unsigned ReplacementCost = getMagicDivisionCost(Magic);
-
-                if (!isProfitable(Instruction::UDiv, ReplacementCost)) { continue; }
-
-                Value *AdjustedDividend = Dividend;
-
-                // (1) pre-shift, per certi divisori pari
-                if (Magic.PreShift != 0) {
-                    AdjustedDividend = Builder.CreateLShr(AdjustedDividend, Magic.PreShift, "magic.preshift");
-                }
-
-                // (2) moltiplicazione alta -> quoziente approssimato
-                Value *Quotient = createUnsignedMultiplyHigh(Builder, AdjustedDividend, Magic.Magic);
-
-                // (3) correzione: Quotient + ((Dividend - Quotient) >> 1)
-                if (Magic.IsAdd) {
-                    Value *Difference = Builder.CreateSub(AdjustedDividend, Quotient, "magic.difference");
-                    Value *HalfDifference = Builder.CreateLShr(Difference, 1, "magic.half");
-                    Quotient = Builder.CreateAdd(Quotient, HalfDifference, "magic.adjusted");
-                }
-
-                // (4) post-shift, per la scala finale
-                if (Magic.PostShift != 0) {
-                    Quotient = Builder.CreateLShr(Quotient, Magic.PostShift, "magic.postshift");
-                }
-
-                Op->replaceAllUsesWith(Quotient);
+                Op->replaceAllUsesWith(Replacement);
                 Op->eraseFromParent();
                 Changed = true;
             }

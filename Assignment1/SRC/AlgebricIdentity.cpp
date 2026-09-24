@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// AlgebricIdentity implementation
+// AlgebricIdentity
 //-----------------------------------------------------------------------------
 // Passo che elimina le operazioni inutili basate su identita' algebriche.
 // Scenari ottimizzabili e relativa trasformazione:
@@ -23,10 +23,10 @@ struct AlgebricIdentity : PassInfoMixin<AlgebricIdentity> {
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
         bool Changed = false;
 
-        for (BasicBlock &B : F) {
+        for (BasicBlock &BB : F) {
             // "*It++" legge l'istruzione corrente e avanza subito l'iteratore:
             // cosi' la cancellazione di I non invalida It.
-            for (auto It = B.begin(); It != B.end();) {
+            for (auto It = BB.begin(); It != BB.end();) {
                 Instruction &I = *It++;
 
                 // Ci interessano solo le operazioni binarie

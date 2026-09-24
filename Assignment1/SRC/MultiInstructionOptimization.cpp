@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// MultiInstructionOptimization implementation
+// MultiInstructionOptimization
 //-----------------------------------------------------------------------------
 // Passo che riconosce una coppia add/sub con la stessa costante e la semplifica.
 // Scenario ottimizzabile e relativa trasformazione:
